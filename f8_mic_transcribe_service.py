@@ -43,7 +43,7 @@ class AppState:
 @dataclass
 class TranscriptionJob:
     audio: np.ndarray
-    wav_path: Path
+    wav_path: Optional[Path]
     duration_sec: float
 
 
@@ -59,12 +59,15 @@ class F8TranscriptionService:
         max_inference_batch_size: int,
         dataset_dir: str,
         wav_subtype: str,
+        save_data: bool,
     ) -> None:
         self.sample_rate = sample_rate
         self.channels = channels
         self.language = language
         self.dataset_dir = Path(dataset_dir)
-        self.dataset_dir.mkdir(parents=True, exist_ok=True)
+        self.save_data = save_data
+        if self.save_data:
+            self.dataset_dir.mkdir(parents=True, exist_ok=True)
         self.wav_subtype = wav_subtype
         self.manifest_path = self.dataset_dir / "manifest.jsonl"
         self.record_index = 0
@@ -143,11 +146,14 @@ class F8TranscriptionService:
 
         audio = np.ascontiguousarray(audio, dtype=np.float32)
         duration_sec = audio.shape[0] / self.sample_rate
-        wav_path = self._next_capture_path()
-        sf.write(str(wav_path), audio, self.sample_rate, subtype=self.wav_subtype)
+        wav_path: Optional[Path] = None
+        if self.save_data:
+            wav_path = self._next_capture_path()
+            sf.write(str(wav_path), audio, self.sample_rate, subtype=self.wav_subtype)
 
         print(f"[F8] Recording stopped. Captured {duration_sec:.2f}s audio.")
-        print(f"Saved WAV: {wav_path}")
+        if wav_path is not None:
+            print(f"Saved WAV: {wav_path}")
         return TranscriptionJob(audio=audio, wav_path=wav_path, duration_sec=duration_sec)
 
     def _paste_text(self, text: str) -> None:
@@ -184,7 +190,10 @@ class F8TranscriptionService:
             if job is None:
                 return
             try:
-                print(f"Transcribing {job.wav_path.name} ...")
+                if job.wav_path is not None:
+                    print(f"Transcribing {job.wav_path.name} ...")
+                else:
+                    print("Transcribing ...")
                 result = self.model.transcribe(
                     audio=(job.audio, self.sample_rate),
                     language=self.language,
@@ -194,12 +203,12 @@ class F8TranscriptionService:
                 print(f"Detected language: {detected_lang}")
                 print(f"Text: {text}")
 
-                txt_path = job.wav_path.with_suffix(".txt")
-                txt_path.write_text(text, encoding="utf-8")
-                self._write_manifest(job.wav_path, text, detected_lang, job.duration_sec)
-
-                print(f"Saved TXT: {txt_path}")
-                print(f"Appended manifest: {self.manifest_path}")
+                if self.save_data and job.wav_path is not None:
+                    txt_path = job.wav_path.with_suffix(".txt")
+                    txt_path.write_text(text, encoding="utf-8")
+                    self._write_manifest(job.wav_path, text, detected_lang, job.duration_sec)
+                    print(f"Saved TXT: {txt_path}")
+                    print(f"Appended manifest: {self.manifest_path}")
                 self._paste_text(text)
             except Exception as exc:  # noqa: BLE001
                 print(f"Transcription failed: {exc}")
@@ -247,6 +256,11 @@ def parse_args() -> argparse.Namespace:
         choices=["PCM_16", "PCM_24", "PCM_32", "FLOAT"],
         help="Subtype for saved WAV files",
     )
+    parser.add_argument(
+        "--enable-save-data",
+        action="store_true",
+        help="Enable saving WAV/TXT/manifest for dataset collection.",
+    )
     return parser.parse_args()
 
 
@@ -262,6 +276,7 @@ def main() -> None:
         max_inference_batch_size=args.max_inference_batch_size,
         dataset_dir=args.dataset_dir,
         wav_subtype=args.wav_subtype,
+        save_data=args.enable_save_data,
     )
 
     print("Service is running.")

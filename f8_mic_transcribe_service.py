@@ -1,8 +1,11 @@
 ﻿import argparse
+import json
 import queue
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -19,6 +22,11 @@ except ImportError as exc:
     raise SystemExit("Missing dependency: sounddevice. Install with `pip install sounddevice`.") from exc
 
 try:
+    import soundfile as sf
+except ImportError as exc:
+    raise SystemExit("Missing dependency: soundfile. Install with `pip install soundfile`.") from exc
+
+try:
     from pynput.keyboard import Controller, Key, Listener
 except ImportError as exc:
     raise SystemExit("Missing dependency: pynput. Install with `pip install pynput`.") from exc
@@ -32,6 +40,13 @@ class AppState:
     last_toggle_ts: float = 0.0
 
 
+@dataclass
+class TranscriptionJob:
+    audio: np.ndarray
+    wav_path: Path
+    duration_sec: float
+
+
 class F8TranscriptionService:
     def __init__(
         self,
@@ -42,16 +57,24 @@ class F8TranscriptionService:
         language: Optional[str],
         max_new_tokens: int,
         max_inference_batch_size: int,
+        dataset_dir: str,
+        wav_subtype: str,
     ) -> None:
         self.sample_rate = sample_rate
         self.channels = channels
         self.language = language
+        self.dataset_dir = Path(dataset_dir)
+        self.dataset_dir.mkdir(parents=True, exist_ok=True)
+        self.wav_subtype = wav_subtype
+        self.manifest_path = self.dataset_dir / "manifest.jsonl"
+        self.record_index = 0
+
         self.state = AppState()
         self.state_lock = threading.Lock()
         self.frames: list[np.ndarray] = []
         self.stream: Optional[sd.InputStream] = None
 
-        self.jobs: queue.Queue[Optional[np.ndarray]] = queue.Queue()
+        self.jobs: queue.Queue[Optional[TranscriptionJob]] = queue.Queue()
         self.keyboard = Controller()
 
         print("Loading model...")
@@ -85,7 +108,23 @@ class F8TranscriptionService:
         self.stream.start()
         print("[F8] Recording started...")
 
-    def _stop_recording(self) -> Optional[np.ndarray]:
+    def _next_capture_path(self) -> Path:
+        self.record_index += 1
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return self.dataset_dir / f"capture_{timestamp}_{self.record_index:04d}.wav"
+
+    def _write_manifest(self, wav_path: Path, text: str, language: str, duration_sec: float) -> None:
+        item = {
+            "audio": str(wav_path),
+            "text": text,
+            "language": language,
+            "sample_rate": self.sample_rate,
+            "duration_sec": round(duration_sec, 3),
+        }
+        with self.manifest_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+    def _stop_recording(self) -> Optional[TranscriptionJob]:
         if self.stream is None:
             return None
         self.stream.stop()
@@ -103,36 +142,64 @@ class F8TranscriptionService:
             audio = audio[:, 0]
 
         audio = np.ascontiguousarray(audio, dtype=np.float32)
-        print(f"[F8] Recording stopped. Captured {audio.shape[0] / self.sample_rate:.2f}s audio.")
-        return audio
+        duration_sec = audio.shape[0] / self.sample_rate
+        wav_path = self._next_capture_path()
+        sf.write(str(wav_path), audio, self.sample_rate, subtype=self.wav_subtype)
+
+        print(f"[F8] Recording stopped. Captured {duration_sec:.2f}s audio.")
+        print(f"Saved WAV: {wav_path}")
+        return TranscriptionJob(audio=audio, wav_path=wav_path, duration_sec=duration_sec)
 
     def _paste_text(self, text: str) -> None:
         if not text:
             print("Empty transcription. Nothing pasted.")
             return
 
+        previous_clipboard = None
+        has_previous = False
+        try:
+            previous_clipboard = pyperclip.paste()
+            has_previous = True
+        except Exception:  # noqa: BLE001
+            has_previous = False
+
         pyperclip.copy(text)
         time.sleep(0.05)
         with self.keyboard.pressed(Key.ctrl):
             self.keyboard.press("v")
             self.keyboard.release("v")
-        print("Transcription pasted at cursor.")
+        time.sleep(0.05)
+
+        if has_previous:
+            try:
+                pyperclip.copy(previous_clipboard)
+            except Exception:  # noqa: BLE001
+                pass
+
+        print("Transcription pasted at cursor and clipboard restored.")
 
     def _worker_loop(self) -> None:
         while True:
-            audio = self.jobs.get()
-            if audio is None:
+            job = self.jobs.get()
+            if job is None:
                 return
             try:
-                print("Transcribing...")
+                print(f"Transcribing {job.wav_path.name} ...")
                 result = self.model.transcribe(
-                    audio=(audio, self.sample_rate),
+                    audio=(job.audio, self.sample_rate),
                     language=self.language,
                 )
                 text = result[0].text.strip() if result else ""
                 detected_lang = result[0].language if result else "unknown"
                 print(f"Detected language: {detected_lang}")
                 print(f"Text: {text}")
+
+                txt_path = job.wav_path.with_suffix(".txt")
+                txt_path.write_text(text, encoding="utf-8")
+                self._write_manifest(job.wav_path, text, detected_lang, job.duration_sec)
+
+                print(f"Saved TXT: {txt_path}")
+                print(f"Appended manifest: {self.manifest_path}")
                 self._paste_text(text)
             except Exception as exc:  # noqa: BLE001
                 print(f"Transcription failed: {exc}")
@@ -146,9 +213,9 @@ class F8TranscriptionService:
 
             if self.state.recording:
                 self.state.recording = False
-                audio = self._stop_recording()
-                if audio is not None:
-                    self.jobs.put(audio)
+                job = self._stop_recording()
+                if job is not None:
+                    self.jobs.put(job)
             else:
                 self.state.recording = True
                 self._start_recording()
@@ -173,6 +240,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--language", default=None, help="Force language, default auto-detect")
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--max-inference-batch-size", type=int, default=32)
+    parser.add_argument("--dataset-dir", default="dataset_collect", help="Directory for collected wav/text data")
+    parser.add_argument(
+        "--wav-subtype",
+        default="PCM_24",
+        choices=["PCM_16", "PCM_24", "PCM_32", "FLOAT"],
+        help="Subtype for saved WAV files",
+    )
     return parser.parse_args()
 
 
@@ -186,6 +260,8 @@ def main() -> None:
         language=args.language,
         max_new_tokens=args.max_new_tokens,
         max_inference_batch_size=args.max_inference_batch_size,
+        dataset_dir=args.dataset_dir,
+        wav_subtype=args.wav_subtype,
     )
 
     print("Service is running.")

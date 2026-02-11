@@ -22,3 +22,5 @@ wheels/
 .vscode/
 venv/
 env/
+
+Qwen3-ASR-0.6B-OV/
